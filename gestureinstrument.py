@@ -15,7 +15,12 @@ from spiralnet import instantiate_model as instantiate_spiralnet
 from torch.nn import init
 from collections import deque
 from pythonosc import udp_client
+import argparse
 
+parser = argparse.ArgumentParser(description="Run the gesture instrument app.")
+parser.add_argument("--ip", type=str, default='127.0.0.1', help="IP for destination to send osc messages")
+parser.add_argument("--port", type=int, default=4590, help="port to send osc messages")
+args = parser.parse_args()
 
 class SpiralnetClassifierGRU(nn.Module):
     def __init__(self, nr_of_classes, embedding_dim=32, nr_spiralnet_layers=4, nr_rnn_layers=2):
@@ -96,7 +101,7 @@ class GestureApp:
         self.capturing = False
         self.gestures = {}
         self.current_gesture = deque(maxlen=45)
-        self.osc_client = udp_client.SimpleUDPClient('127.0.0.1', 11000)  # IP and port for Ableton Live
+        self.osc_client = udp_client.SimpleUDPClient(args.ip, args.port)  # IP and port for Ableton Live
         # Set the signal handler
         self.check_output = {} 
 
