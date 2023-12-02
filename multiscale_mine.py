@@ -338,7 +338,7 @@ class Multiscale_MINE_PQMF(nn.Module):
     def __init__(self, 
                  cell,
                  nr_time_scales = 8, 
-                 nr_frequency_bands = 13, 
+                 nr_frequency_bands = 16, 
                  embedding_dim = 100, 
                  input_dim = 1024, 
                  nr_layers_per_timescale = 4, 
