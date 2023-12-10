@@ -16,6 +16,7 @@ import deepspeed
 from deepspeed.ops.adam import DeepSpeedCPUAdam, FusedAdam
 
 
+
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -109,12 +110,32 @@ class BetaWarmupCallback(pl.Callback):
         self.state.update(state_dict)
 
 
+
+class L2Wrap(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, loss, y):
+        ctx.save_for_backward(y)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        y = ctx.saved_tensors[0]
+        # to encourage the logits to be close to 0
+        factor = 1e-4 / (y.shape[0] * y.shape[1])
+        maxx, ids = torch.max(y, -1, keepdim=True)
+        gy = torch.zeros_like(y)
+        gy.scatter_(-1, ids, maxx * factor)
+        return (grad_output, gy)
+
+
+
 @gin.configurable
 class RAVE_RWKV(pl.LightningModule):
 
     def __init__(
         self,
         input_size,
+        batch_size,
         latent_size,
         sampling_rate,
         encoder,
@@ -135,7 +156,7 @@ class RAVE_RWKV(pl.LightningModule):
         enable_pqmf_encode: bool = True,
         enable_pqmf_decode: bool = True,
         # RWKV specific arguments
-        FLOAT_MODE='fl32',
+        FLOAT_MODE= 'bf16', #'fl32',
         RUN_DEVICE='cuda',
         n_embd=256,
         n_layer=32,
@@ -200,6 +221,7 @@ class RAVE_RWKV(pl.LightningModule):
         self.register_buffer("fidelity", torch.zeros(latent_size))
 
         self.input_size = input_size
+        self.batch_size = batch_size
         self.latent_size = latent_size
 
         self.automatic_optimization = False
@@ -229,13 +251,17 @@ class RAVE_RWKV(pl.LightningModule):
         
 
 
-        x = torch.rand(1, 1, 2**17).to(device)
+        x = torch.rand(13, 1, 2**17).to(device)
         x = self.pqmf(x)
+        print('pqmf batch ok, out shape :' , x.shape)
         z = self.encoder.reparametrize(self.encoder(x))[:1][0]
+        print('encoder batch ok out shape :' , z.shape)
         self.embedding_sequence_length = z.shape[2]
         z = z.view(1, 1, -1)
-        z = self.rwkv(z)
-        print('z.shape after rwkv applied : ', z.shape)
+        print('z.shape', z.shape)
+        #z = self.rwkv(z)
+        #print('rwkv batch ok, out shape :' , z.shape)
+        #print('z.shape after rwkv applied : ', z.shape)
         print('self.embedding_sequence_length ', self.embedding_sequence_length)
         print('self.encoder.reparametrize(self.encoder(x))[:1][0].view(1, 1, -1) shape : ', z.shape) 
         print('self.encoder.reparametrize(self.encoder(x))[:1][0].shape : ', self.encoder.reparametrize(self.encoder(x))[:1][0].shape)
@@ -249,14 +275,98 @@ class RAVE_RWKV(pl.LightningModule):
         #print('self.input_size :', self.input_size)
         #print('self.latent_size :', self.latent_size)
         #self.automatic_optimization = False
+        i=0
+        print('params requiering grad :')
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                print(name)
+            i+=1
+        print(i, 'parameters printed')
+
         print('init complete ?')
 
     def configure_optimizers(self):
-        gen_p = list(self.encoder.parameters())
-        gen_p += list(self.decoder.parameters())
+
+        rwkv_params = list(self.rwkv.parameters())# rwkv_param_dict = {n: p for n, p in self.named_parameters()} #
+        rave_params =  list(self.encoder.parameters()) + \
+                        list(self.pqmf.parameters()) + \
+                        list(self.decoder.parameters())
+        dis_params = list(self.discriminator.parameters())
+        
+        param_groups = [
+        {'params': rwkv_params, 'lr': self.args.lr_init, 'betas': self.args.betas},
+        {'params': rave_params, 'lr': 1e-4 , 'betas':(.5, .9)}]   
+
+        gen_opt = FusedAdam(param_groups, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
+        dis_opt = torch.optim.Adam(dis_params, 1e-4, (.5, .9))
+        
+        return gen_opt, dis_opt
+
+    def _____configure_optimizers__(self):
+        gen_p = list(self.encoder.parameters()) + \
+                list(self.decoder.parameters()) + \
+                list(self.rwkv.parameters())
         dis_p = list(self.discriminator.parameters())
 
         gen_opt = torch.optim.Adam(gen_p, 1e-4, (.5, .9))
+        dis_opt = torch.optim.Adam(dis_p, 1e-4, (.5, .9))
+
+        args = self.args
+
+        lr_decay = set()
+        lr_1x = set()
+        lr_2x = set()
+        lr_3x = set()
+        for n, p in self.named_parameters():
+            if "time_mix" in n and args.layerwise_lr > 0:
+                lr_2x.add(n) if args.my_pile_stage == 2 else lr_1x.add(n)
+            elif "time_decay" in n and args.layerwise_lr > 0:
+                lr_3x.add(n) if args.my_pile_stage == 2 else lr_2x.add(n)
+            elif "time_faaaa" in n and args.layerwise_lr > 0:
+                lr_2x.add(n) if args.my_pile_stage == 2 else lr_1x.add(n)
+            elif "time_first" in n and args.layerwise_lr > 0:
+                lr_3x.add(n)
+            elif len(p.squeeze().shape) >= 2 and args.weight_decay > 0:
+                lr_decay.add(n)
+            else:
+                lr_1x.add(n)
+
+        lr_decay = sorted(list(lr_decay))
+        lr_1x = sorted(list(lr_1x))
+        lr_2x = sorted(list(lr_2x))
+        lr_3x = sorted(list(lr_3x))
+
+        param_dict = {n: p for n, p in self.named_parameters()}
+        
+        if args.layerwise_lr > 0:
+            optim_groups = [
+                {"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0},
+                {"params": [param_dict[n] for n in lr_2x], "weight_decay": 0.0, "my_lr_scale": 2.0},
+                {"params": [param_dict[n] for n in lr_3x], "weight_decay": 0.0, "my_lr_scale": 3.0}
+            ]
+        else:
+            optim_groups = [{"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0}]
+
+        if args.weight_decay > 0:
+            optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}]
+
+        # Assigning RWKV parameters to the generator optimizer
+        for optim_group in optim_groups:
+            for n in optim_group["params"]:
+                gen_p.append(n)
+
+        gen_opt = torch.optim.Adam(gen_p, args.lr_init, betas=args.betas)
+
+        return gen_opt, dis_opt
+
+
+    def __configure_optimizers_(self):
+        gen_p = list(self.encoder.parameters())
+        gen_p += list(self.pqmf.parameters())
+        gen_p += list(self.decoder.parameters())
+        dis_p = list(self.discriminator.parameters())
+
+        
         dis_opt = torch.optim.Adam(dis_p, 1e-4, (.5, .9))
 
 
@@ -304,7 +414,7 @@ class RAVE_RWKV(pl.LightningModule):
         # print('1x', lr_1x)
         # print('2x', lr_2x)
         # print('3x', lr_3x)
-        param_dict = {n: p for n, p in self.named_parameters()}
+        param_dict = {n: p for n, p in self.rwkv.named_parameters()}
         
         if args.layerwise_lr > 0:
             if args.my_pile_stage == 2:
@@ -321,17 +431,36 @@ class RAVE_RWKV(pl.LightningModule):
                 ]
         else:
             optim_groups = [{"params": [param_dict[n] for n in lr_1x], "weight_decay": 0.0, "my_lr_scale": 1.0}]
+            
+            
 
         if args.weight_decay > 0:
             optim_groups += [{"params": [param_dict[n] for n in lr_decay], "weight_decay": args.weight_decay, "my_lr_scale": 1.0}]
             if self.deepspeed_offload:
-                return gen_opt, dis_opt#, DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
-            return gen_opt, dis_opt#, FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
+                for optim_group in optim_groups:    
+                    for k, v in optim_group.items():
+                        gen_p += optim_group[k]
+                    gen_opt = torch.optim.Adam(gen_p, 1e-4, (.5, .9))
+                return gen_opt, dis_opt, #DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=True, amsgrad=False)
+            for optim_group in optim_groups:  
+                for k, v in optim_group.items():
+                    gen_p += optim_group[k]
+                    gen_opt = torch.optim.Adam(gen_p, 1e-4, (.5, .9))
+            return gen_opt, dis_opt, #FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=True, amsgrad=False)
         else:
             if self.deepspeed_offload:
-                return gen_opt, dis_opt#, DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=False, weight_decay=0, amsgrad=False)
-            return gen_opt, dis_opt#, FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
-        # return ZeroOneAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, weight_decay=0, amsgrad=False, cuda_aware=False)
+                for optim_group in optim_groups:  
+                    for k, v in optim_group.items():
+                        gen_p += optim_group[k]
+                        gen_opt = torch.optim.Adam(gen_p, 1e-4, (.5, .9))
+                return gen_opt, dis_opt, #DeepSpeedCPUAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adamw_mode=False, weight_decay=0, amsgrad=False)
+            else:
+                for optim_group in optim_groups:  
+                    for k, v in optim_group.items():
+                        gen_p += optim_group[k]
+                        gen_opt = torch.optim.Adam(gen_p, 1e-4, (.5, .9))
+            return gen_opt, dis_opt, #FusedAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, adam_w_mode=False, weight_decay=0, amsgrad=False)
+        return gen_opt, dis_opt #ZeroOneAdam(optim_groups, lr=self.args.lr_init, betas=self.args.betas, eps=self.args.adam_eps, bias_correction=True, weight_decay=0, amsgrad=False, cuda_aware=False)
 
     @property
     def deepspeed_offload(self) -> bool:
@@ -356,6 +485,19 @@ class RAVE_RWKV(pl.LightningModule):
 
     #def training_step(self, batch, batch_idx):
 
+
+    def on_after_backward(self):
+        # This function is called after the backward pass
+        if self.trainer.global_rank == 0:  # Log only for the first process in DDP
+            for name, param in self.named_parameters():
+                #print(name, param.grad is not None)
+                #print(param.grad)
+                # Ensure the parameter has gradients
+                if param.grad is not None:
+                   self.logger.experiment.add_histogram(f'{name}_grad', param.grad, self.global_step)
+                #else:
+                #    print(f"No gradient for {name}")
+
     def training_step(self, batch, batch_idx):
         print("Batch type:", type(batch))
         print("Batch length:", len(batch))
@@ -372,7 +514,7 @@ class RAVE_RWKV(pl.LightningModule):
         else:
             x_multiband = x
         p.tick('decompose')
-
+        #print('x_multiband shape :', x_multiband.shape)
         self.encoder.set_warmed_up(self.warmed_up)
         self.decoder.set_warmed_up(self.warmed_up)
 
@@ -385,11 +527,22 @@ class RAVE_RWKV(pl.LightningModule):
         z, reg = self.encoder.reparametrize(z_pre_reg)[:2]
         p.tick('encode')
         
-        #insert RWKV here
+        #print('input shape to rwkv :', z.shape)
+        z = self.rwkv(z.view(self.batch_size, self.embedding_sequence_length, -1)).view(self.batch_size, -1, self.embedding_sequence_length)
+        #print('z.shape OK : ', z.shape)
+        #t = time()-t
+        #print('encoding time :', t)
+        #print('encoded z.shape', z.shape )
+        #print(z)
+
+
+
         
         # DECODE LATENT
         y_multiband = self.decoder(z)
-
+        #print('y_multiband.shape OK ', y_multiband.shape)
+        #if torch.isnan(y_multiband).any():
+        #    print('nan found : ')
         p.tick('decode')
 
         if self.valid_signal_crop and self.receptive_field.sum():
@@ -489,11 +642,15 @@ class RAVE_RWKV(pl.LightningModule):
             dis_opt.step()
             p.tick('dis opt')
         else:
+            
             gen_opt.zero_grad()
             loss_gen_value = 0.
             for k, v in loss_gen.items():
                 loss_gen_value += v * self.weights.get(k, 1.)
+            
+            #L2Wrap.apply(loss_gen_value, y).backward() 
             loss_gen_value.backward()
+            #self.on_after_backward()
             gen_opt.step()
 
         # LOGGING
@@ -508,16 +665,24 @@ class RAVE_RWKV(pl.LightningModule):
         p.tick('logging')
 
     def encode(self, x):
+        #t = time()
         if self.pqmf is not None and self.enable_pqmf_encode:
             x = self.pqmf(x)
         z, = self.encoder.reparametrize(self.encoder(x))[:1]
-        z = self.rwkv(z.view(1, 1, -1))
+        z = self.rwkv(z)
+        #t = time()-t
+        #print('encoding time :', t)
+        #print('encoded z.shape', z.shape )
         return z.view(1, -1, self.embedding_sequence_length)
 
     def decode(self, z):
+        #t = time()
         y = self.decoder(z)
         if self.pqmf is not None and self.enable_pqmf_decode:
             y = self.pqmf.inverse(y)
+        #t = time()-t
+        #print('encoding time :', t)
+        #print('decoded y.shape', y.shape )
         return y
 
     def forward(self, x):
