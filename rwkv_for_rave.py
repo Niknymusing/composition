@@ -839,7 +839,7 @@ class RWKV(nn.Module):
         #print('idx.size() =', idx.size())
         B, T, _ = x.size()
         assert T <= args.ctx_len, "Cannot forward, model ctx_len is exhausted."
-
+        x = x.view(1, 1, -1)
         #self.emb(idx)
         x_emb = x
         #print('x_emb.shape = ', x_emb.shape, 'x.shape =', x.shape, 'torch.isnan(x).any() 1 :' ,torch.isnan(x).any())
