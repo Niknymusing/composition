@@ -538,18 +538,18 @@ class RAVE_RWKV(pl.LightningModule):
 # len 2**17, y is the following 2**17 samples chunk translated by 
 # window of 2048 samples in relation to x. Add a prediction loss on 
 # the last 2048 sampels of f(x) against the last 2048 samples of y.
-# then use the reconstruction loss including the GANs already implemented 
+# Then use the reconstruction loss including the GANs already implemented 
 # below on x[2048:..] and y[...:2048]. Initially the prediction loss will
-# be computed using the same audio distance function as bellow, later there
+# be computed using the same audio distance function as below, later there
 # will be added user-dependent regularization. 
 # 
 # Moreover we will add MINE-regularization networks which preassures the 
 # network to compress the latent embedding vectors (output from rwkv) onto 
 # subspaces of maximal mutual information to musically relevant features. 
 # Initially these features are a series 8-octaves spike pulses with learnt 
-# frequency and phase, as well as a series of 8-octave sine oscillations 
+# frequencies and phases, as well as a series of 8-octave sine oscillations 
 # with learnt frequency and phase, both categories regularised by 
-# Gram-matrix norm, to approximate frames for their respective spaces.
+# Gram-matrix norm, to approximate frames for their respective subspaces. 
 
 
 
