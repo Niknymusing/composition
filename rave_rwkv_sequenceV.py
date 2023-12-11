@@ -223,7 +223,7 @@ class RAVE_RWKV(pl.LightningModule):
         self.input_size = input_size
         self.batch_size = batch_size
         self.latent_size = latent_size
-
+        self.n_embd = n_embd
         self.automatic_optimization = False
 
         # SCHEDULE
@@ -259,12 +259,39 @@ class RAVE_RWKV(pl.LightningModule):
         self.embedding_sequence_length = z.shape[2]
         z = z.view(1, 1, -1)
         print('z.shape', z.shape)
+        x = torch.rand(1, 1, 2**17).to(device)
+        x1 = self.pqmf(x)
+        z = self.encoder.reparametrize(self.encoder(x1))[:1][0]
+        z = self.rwkv(z.view(-1, self.embedding_sequence_length, self.n_embd))
+        
+        #t = time()-t
+        #print('encoding time :', t)
+        #print('encoded z.shape', z.shape )
+        z = z.view(-1, self.n_embd, self.embedding_sequence_length) #.view(1, -1, self.embedding_sequence_length)
+        y = self.decoder(z)
+        y = self.pqmf.inverse(y)
+        t = time()
+        x1 = self.pqmf(x)
+        z = self.encoder.reparametrize(self.encoder(x1))[:1][0]
+        z = self.rwkv(z.view(-1, self.embedding_sequence_length, self.n_embd))
+        
+        #t = time()-t
+        #print('encoding time :', t)
+        #print('encoded z.shape', z.shape )
+        z = z.view(-1, self.n_embd, self.embedding_sequence_length) #.view(1, -1, self.embedding_sequence_length)
+        y = self.decoder(z)
+        y = self.pqmf.inverse(y)
+        t = time() - t
+        print('estimated forward time = ', t)
+        print('output shape of forward : ', y.shape)
+        print('is nan any y :', torch.isnan(y).any())
+
         #z = self.rwkv(z)
         #print('rwkv batch ok, out shape :' , z.shape)
         #print('z.shape after rwkv applied : ', z.shape)
         print('self.embedding_sequence_length ', self.embedding_sequence_length)
         print('self.encoder.reparametrize(self.encoder(x))[:1][0].view(1, 1, -1) shape : ', z.shape) 
-        print('self.encoder.reparametrize(self.encoder(x))[:1][0].shape : ', self.encoder.reparametrize(self.encoder(x))[:1][0].shape)
+        #print('self.encoder.reparametrize(self.encoder(x))[:1][0].shape : ', self.encoder.reparametrize(self.encoder(x))[:1][0].shape)
         #print('self.encoder.reparametrize(self.encoder(x)).shape : ', self.encoder.reparametrize(self.encoder(x)).shape)
         
         s = self.input_size  # should be 
@@ -498,7 +525,34 @@ class RAVE_RWKV(pl.LightningModule):
                 #else:
                 #    print(f"No gradient for {name}")
 
+
+
+
+
+#################################################################################################
+
+
     def training_step(self, batch, batch_idx):
+
+# develop to handle x, y inputs as follows: x is an input chunk of
+# len 2**17, y is the following 2**17 samples chunk translated by 
+# window of 2048 samples in relation to x. Add a prediction loss on 
+# the last 2048 sampels of f(x) against the last 2048 samples of y.
+# then use the reconstruction loss including the GANs already implemented 
+# below on x[2048:..] and y[...:2048]. Initially the prediction loss will
+# be computed using the same audio distance function as bellow, later there
+# will be added user-dependent regularization. 
+# 
+# Moreover we will add MINE-regularization networks which preassures the 
+# network to compress the latent embedding vectors (output from rwkv) onto 
+# subspaces of maximal mutual information to musically relevant features. 
+# Initially these features are a series 8-octaves spike pulses with learnt 
+# frequency and phase, as well as a series of 8-octave sine oscillations 
+# with learnt frequency and phase, both categories regularised by 
+# Gram-matrix norm, to approximate frames for their respective spaces.
+
+
+
         print("Batch type:", type(batch))
         print("Batch length:", len(batch))
         if isinstance(batch, list):
@@ -514,7 +568,7 @@ class RAVE_RWKV(pl.LightningModule):
         else:
             x_multiband = x
         p.tick('decompose')
-        #print('x_multiband shape :', x_multiband.shape)
+
         self.encoder.set_warmed_up(self.warmed_up)
         self.decoder.set_warmed_up(self.warmed_up)
 
@@ -527,22 +581,11 @@ class RAVE_RWKV(pl.LightningModule):
         z, reg = self.encoder.reparametrize(z_pre_reg)[:2]
         p.tick('encode')
         
-        #print('input shape to rwkv :', z.shape)
         z = self.rwkv(z.view(self.batch_size, self.embedding_sequence_length, -1)).view(self.batch_size, -1, self.embedding_sequence_length)
-        #print('z.shape OK : ', z.shape)
-        #t = time()-t
-        #print('encoding time :', t)
-        #print('encoded z.shape', z.shape )
-        #print(z)
-
-
-
         
         # DECODE LATENT
         y_multiband = self.decoder(z)
-        #print('y_multiband.shape OK ', y_multiband.shape)
-        #if torch.isnan(y_multiband).any():
-        #    print('nan found : ')
+
         p.tick('decode')
 
         if self.valid_signal_crop and self.receptive_field.sum():
@@ -669,11 +712,11 @@ class RAVE_RWKV(pl.LightningModule):
         if self.pqmf is not None and self.enable_pqmf_encode:
             x = self.pqmf(x)
         z, = self.encoder.reparametrize(self.encoder(x))[:1]
-        z = self.rwkv(z)
+        z = self.rwkv(z.view(-1, self.embedding_sequence_length, self.n_embd))
         #t = time()-t
         #print('encoding time :', t)
         #print('encoded z.shape', z.shape )
-        return z.view(1, -1, self.embedding_sequence_length)
+        return z.view(-1, self.n_embd, self.embedding_sequence_length) #.view(1, -1, self.embedding_sequence_length)
 
     def decode(self, z):
         #t = time()
