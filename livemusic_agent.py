@@ -37,6 +37,8 @@ osc_output_ip = '127.0.0.1'
 osc_output_port = 11000
 osc_input_ip = '127.0.0.1'
 osc_input_port = 4592
+trainer_osc_ip = '192.168.1.103'
+trainer_osc_port = 8004
 
 KERNEL_SIZE = 3
 DILATIONS = [
@@ -94,8 +96,36 @@ class SpiralnetRAVEClassifierGRU(nn.Module):
         values = self.output_values_ff_list[class_prediction](x)
         softmax_values = self.softmax(values)
         #values = 127 * torch.sigmoid(values) 
-        downsamples_embedding_for_transmission = F.avg_pool1d(pqmf, kernel_size=4, stride=4)
-        return logits, class_prediction, softmax_values, downsamples_embedding_for_transmission
+        downsampled_embedding_for_transmission = F.avg_pool1d(pqmf, kernel_size=4, stride=4)
+        return logits, class_prediction, softmax_values, downsampled_embedding_for_transmission
+
+class ModelManager:
+    def __init__(self, model_class, *model_args):
+        self.model1 = model_class(*model_args)
+        self.model2 = model_class(*model_args)
+        self.model1.eval()
+        self.model2.eval()
+        self.lock = threading.Lock() 
+        self.use_model1 = False  # Flag to indicate which model is currently active
+        self.switch_time = time.time()
+
+
+    def update_model(self, model, updated_params):
+        # Update the specified model with the received parameters
+        with torch.no_grad():
+            for param, new_param in zip(model.parameters(), updated_params):
+                param.data.copy_(new_param)
+
+    def get_active_model(self):
+        # Return the currently active model
+        return self.model1 if self.use_model1 else self.model2
+
+    def switch_models(self):
+        # Switch the active model
+        #print('switch model, time = ', time.time()-self.switch_time)
+        self.use_model1 = not self.use_model1
+        self.switch_time = time.time()
+
 
 class GestureDataset(Dataset):
     def __init__(self, gesture_dict):
@@ -125,14 +155,16 @@ class GestureApp:
         
         
         # Initialize variables
+        self.use_model1 = True
         self.capturing = False
         self.gestures = {}
-        self.model = SpiralnetRAVEClassifierGRU(10) #None§
-        print('model number of parameters = ', sum(p.numel() for p in self.model.parameters() if p.requires_grad) )
+        self.model1 = SpiralnetRAVEClassifierGRU(10) #None§
+        self.model2 = SpiralnetRAVEClassifierGRU(10)
+        print('model number of parameters = ', sum(p.numel() for p in self.model1.parameters() if p.requires_grad) )
         #self.state = "initial_state"
         self.state = "prediction_state"
         self.pose_buffer = deque(maxlen=45)
-        self.assets = {'model': self.model} 
+        #self.assets = {'model': self.model} 
         self.criterion = nn.CrossEntropyLoss()
         self.current_nr_of_classes = 0
         self.nr_class_labels = 0
@@ -170,7 +202,7 @@ class GestureApp:
         self.osc_output_port = osc_output_port
         self.training_output_port = 8004
         self.osc_client = udp_client.SimpleUDPClient(osc_output_ip, osc_output_port)#('146.70.72.139', 42000)#('127.0.0.1', 11000)  # IP and port for Ableton Live
-        self.osc_client_training_data = udp_client.SimpleUDPClient(osc_output_ip, self.training_output_port )
+        self.osc_client_training_data = udp_client.SimpleUDPClient(trainer_osc_ip, trainer_osc_port)
         self.check_output = {} 
         self.reward_labels = {}
         self.current_prediction = None
@@ -210,52 +242,101 @@ class GestureApp:
         self.pose_count = 0
         self.audio_buffer_count = 0
         self.poses_deque = deque(maxlen=self.buffer_size)
-        self.audio_buffers_and_pose_counts_deque = deque(maxlen=1000)
+        self.audio_buffers_and_pose_counts_deque = deque(maxlen=10)
         self.current_audio_frame_read = 0
         self.current_audio_frame_play = 0
         self.random_test_pose_data = torch.rand(10000, 33, 3)
         
         
-        self.audio_buffers_and_pose_counts_deque.append([np.zeros((1, 1, self.audio_buffer_size), dtype=np.float32), self.audio_buffer_count, self.pose_count])
-        self.model.eval()
+        #self.audio_buffers_and_pose_counts_deque.append([np.zeros((1, 1, self.audio_buffer_size), dtype=np.float32), self.audio_buffer_count, self.pose_count])
+        self.model1.eval()
+        self.model2.eval()
         # Start the asynchronous processing thread
         self.device = torch.device('cpu')#torch.device("mps" if torch.backends.mps.is_available() else "cpu")
         print('device = ', self.device)
-        self.model.to(self.device)
+        self.model1.to(self.device)
+        self.model2.to(self.device)
         self.input_audio_tensor = torch.zeros(1, 1, self.audio_buffer_size).to(self.device)#
         self.input_pose_tensor = torch.zeros(33, 3).to(self.device)
         self.poses_deque.append(self.input_pose_tensor)
+        self.front_buffer = deque(maxlen=10)
+        self.back_buffer = deque(maxlen=10)
+        self.buffer_lock = threading.Lock()
+        self.updating_buffer = False
+        self.audio_buffer_queue = queue.Queue()
+        
+
+
         #self.processing_thread = threading.Thread(target=self.process_audio)
         #self.processing_thread.start()
 
-
-    def audio_callback(self, in_data, frame_count, time_info, status):
-        print('audio callback ', self.audio_buffer_count)#, flush=True)
-        audio_data = np.frombuffer(in_data, dtype=np.float32)
-        print(audio_data)
-        self.audio_buffers_and_pose_counts_deque.append([audio_data, self.audio_buffer_count, self.pose_count])  # Appending the new audio data to the right end of the deque
-        self.audio_buffer_count +=1
-        #print('audio callback ', self.current_audio_frame_read, flush=True)
+    def audio_callback_(self, in_data, frame_count, time_info, status):
+        #audio_data = np.frombuffer(in_data, dtype=np.float32)
+        with self.buffer_lock:
+            self.back_buffer.append((in_data, self.audio_buffer_count, self.pose_count))
+            self.audio_buffer_count += 1
         return (in_data, pyaudio.paContinue)
     
+    def audio_callback(self, in_data, frame_count, time_info, status):
+        #audio_data = np.frombuffer(in_data, dtype=np.float32)
+        self.audio_buffer_queue.put([in_data, self.audio_buffer_count, self.pose_count])
+        self.audio_buffer_count += 1
+        #print('audio buffer ',  self.audio_buffer_count)
+        return (in_data, pyaudio.paContinue)
+
+    
+    
+
+    
+    def start_audio_stream(self):
+        audio = pyaudio.PyAudio()
+
+        # List all available audio devices
+        info = audio.get_host_api_info_by_index(0)
+        num_devices = info.get('deviceCount')
+        for i in range(0, num_devices):
+            if (audio.get_device_info_by_host_api_device_index(0, i).get('maxInputChannels')) > 0:
+                device_info = audio.get_device_info_by_host_api_device_index(0, i)
+                print("Input Device id ", i, " - ", device_info.get('name'))
+
+        # Open an audio stream with a specific input device
+        stream = audio.open(format=pyaudio.paFloat32,
+                            channels=1,
+                            rate=44100,
+                            input=True,
+                            frames_per_buffer=self.audio_buffer_size,
+                            stream_callback=self.audio_callback,
+                            input_device_index=1)  # Set input device index to 2
+
+        stream.start_stream()
+        print('audio stream started')
+        return stream, audio
+
     def agent_model_inference(self, audio_buffer, pose):
-        #model = self.assets['model']
+
+        audio_data = np.frombuffer(audio_buffer, dtype=np.float32)
+        audio_frame = np.copy(audio_data)
+        
+        if self.use_model1:
+            model = self.model1
+        else:
+            model = self.model2
         with torch.no_grad():
             #print('type(audio_buffer)', type(audio_buffer))
             #if isinstance(audio_buffer, np.ndarray):
             # Reshape and convert audio_buffer to a tensor, then update input_audio_tensor
-            audio_buffer = np.copy(audio_buffer) # unfortunately need to do a copy since the audio buffer is not writeable
+            #audio_buffer = np.copy(audio_buffer) # unfortunately need to do a copy since the audio buffer is not writeable
             
-            self.input_audio_tensor[:] = torch.from_numpy(audio_buffer).view(1, 1, -1).float()#.to(self.device)
-                
+            self.input_audio_tensor[:] = torch.from_numpy(audio_frame).view(1, 1, -1).float()#.to(self.device)
+            #print('self.input_audio_tensor[:] : ', self.input_audio_tensor[:])
             #else:
             #    raise ValueError("Expected audio_buffer to be a numpy array")
 
             #self.input_audio_tensor[:] = torch.from_numpy(audio_buffer).view(1, 1, -1).float()
             audio_tensor, pose_tensor = self.input_audio_tensor, pose#.to(self.device)
-            #print('audio tensor shape : ', audio_tensor.shape, 'pose tensor shape : ', pose_tensor.shape)
+            print('audio tensor shape : ', audio_tensor.shape, 'pose tensor shape : ', pose_tensor.shape)
             #ti = time.time()
-            logits, class_prediction, softmax_values, input_audio_embedding = self.model(pose_tensor, audio_tensor)
+            logits, class_prediction, softmax_values, input_audio_embedding = model(pose_tensor, audio_tensor)
             #print(logits)
             #ti = time.time()-ti
             #print('inference time in func = ', ti)
@@ -263,6 +344,65 @@ class GestureApp:
             self.map_midi_to_ableton(class_prediction, softmax_values) 
         return logits, class_prediction, softmax_values, input_audio_embedding
 
+    def capture_gestures_and_inference(self):
+
+        #osc server : 
+        # dispatcher 1: receive poses osc messages from e.g mediapipe poses input app
+        # dispatcher 2: receive feedback values from RLHF app
+        # todo : (i) create realtime training infrastructure on linux gpu pc, transfering model statedict over local network to update 
+        # the model in inference. 
+        # (ii) implement model transfer functionality in inference app, to load the most recently received model state dict, 
+        # and compiling and providing the training data for the training server in realtime over local network.
+
+        print("Starting ableton agent")
+        #self.audio_thread = threading.Thread(target=self.start_audio_stream)
+        self.osc_thread = threading.Thread(target=self.start_osc_server)
+        #self.audio_thread = threading.Thread(target=self.start_audio_stream)
+        
+        #elf.audio_thread.start()
+        self.osc_thread.start()
+        self.start_audio_stream()
+        #self.audio_thread.start()
+        #self.start_osc_server()
+        
+        #self.osc_client_training_data.send_message("/testing", 0)
+
+        while True:
+            #print('while loop started')
+            #t = time.time()
+            #if len(self.audio_buffers_and_pose_counts_deque) > 0:
+            #    audio_buffer, audio_buffer_count, pose_count = self.audio_buffers_and_pose_counts_deque[-1]
+            audio_buffer, audio_buffer_count, pose_count = self.audio_buffer_queue.get()
+            #with self.buffer_lock:
+            #    if len(self.back_buffer) > 0:
+            #        self.front_buffer, self.back_buffer = self.back_buffer, self.front_buffer
+            # Now process data outside of the lock to keep lock time short
+            #while len(self.front_buffer) > 0:
+            #    audio_buffer, audio_buffer_count, pose_count = self.front_buffer.popleft()
+            # Safely swap buffers at a point you deem safe in the loop
+                #self.swap_buffers()
+                #while len(self.front_buffer) > 0:
+                # Process data from the front buffer
+                    #audio_buffer, audio_buffer_count, pose_count = self.back_buffer.popleft()
+            pose = self.poses_deque[pose_count]
+
+            #print('pose : ', pose)
+                #print('pose_count : ', pose_count)
+                #print('len(self.poses_deque) : ', len(self.poses_deque))
+                #pose = self.poses_deque[pose_count]
+                #print('audio_buffer : ', audio_buffer)
+                #print('pose : ', pose)
+                #print(pose)
+                #print(audio_buffer)
+                #print("Type of audio buffer:", type(audio_buffer), flush=True)
+                #print("Content of deque:", [type(item[0]) for item in list(self.audio_buffers_and_pose_counts_deque)], flush=True)
+
+            logits, class_prediction, softmax_values, input_audio = self.agent_model_inference(audio_buffer, pose)
+
+            self.transmit_training_data(logits, class_prediction, softmax_values, pose_count, audio_buffer_count, input_audio)
+                #self.current_audio_frame_play = self.current_audio_frame_read
+                #t = time.time()-t
+                #print('agent inference time = ', t)
 
     def transmit_training_data(self, logits, class_prediction, softmax_values, pose_count, audio_buffer_count, input_audio_embedding):
         logits_list = logits.flatten().tolist()
@@ -285,6 +425,40 @@ class GestureApp:
         ]
 
         self.osc_client_training_data.send_message("/training_data", data_list)
+
+
+    def audio_callback__(self, in_data, frame_count, time_info, status):
+        print('audio callback ', self.audio_buffer_count)
+        self.buffer_lock.acquire()
+        try:
+            self.updating_buffer = True
+            self.back_buffer.append([in_data, self.audio_buffer_count, self.pose_count])
+            self.audio_buffer_count += 1
+            self.updating_buffer = False
+        finally:
+            self.buffer_lock.release()
+        return (in_data, pyaudio.paContinue)
+    
+    def swap_buffers(self):
+        self.buffer_lock.acquire()
+        try:
+            # Swap the buffers
+            self.front_buffer, self.back_buffer = self.back_buffer, self.front_buffer
+        finally:
+            self.buffer_lock.release()
+
+
+
+    def audio_callback_(self, in_data, frame_count, time_info, status):
+        print('audio callback ', self.audio_buffer_count)#, flush=True)
+        #audio_data = np.frombuffer(in_data, dtype=np.float32)
+        #print(audio_data)
+        # check that self.audio_buffers_and_pose_counts_deque is never read from whenever it is being modified here:
+        self.audio_buffers_and_pose_counts_deque.append([in_data, self.audio_buffer_count, self.pose_count])  # Appending the new audio data to the right end of the deque
+        self.audio_buffer_count +=1
+        #print('audio callback ', self.current_audio_frame_read, flush=True)
+        return (in_data, pyaudio.paContinue)
+    
 
     def map_agent_outputs(self, *outputs):
         # depending on output prediction class, logits distribution, action truth value, timing value
@@ -344,10 +518,13 @@ class GestureApp:
     def handle_poses(self, unused_addr, *args):
         
         self.input_pose_tensor = torch.tensor(args).view(33, 3)
+        #self.lock.acquire()
+        #try:
         self.poses_deque.append(self.input_pose_tensor)
-        self.pose_count+=1
-        #print(len(args), self.pose_count)
-        pass
+        self.pose_count = len(self.poses_deque) - 1
+        #finally:
+        #    self.lock.release()
+
 
 
     def store_as_torch_tensors(self, gestures):
@@ -357,72 +534,11 @@ class GestureApp:
                 torch_tensor = torch.from_numpy(numpy_array)
                 gestures[key][i] = torch_tensor
     
-    def start_audio_stream(self):
-        audio = pyaudio.PyAudio()
-
-        # List all available audio devices
-        info = audio.get_host_api_info_by_index(0)
-        num_devices = info.get('deviceCount')
-        for i in range(0, num_devices):
-            if (audio.get_device_info_by_host_api_device_index(0, i).get('maxInputChannels')) > 0:
-                device_info = audio.get_device_info_by_host_api_device_index(0, i)
-                print("Input Device id ", i, " - ", device_info.get('name'))
-
-        # Open an audio stream with a specific input device
-        stream = audio.open(format=pyaudio.paFloat32,
-                            channels=1,
-                            rate=44100,
-                            input=True,
-                            frames_per_buffer=self.audio_buffer_size,
-                            stream_callback=self.audio_callback,
-                            input_device_index=1)  # Set input device index to 2
-
-        stream.start_stream()
-        print('audio stream started')
-        return stream, audio
+    
 
 
 
-    def capture_gestures_and_inference(self):
-
-        #osc server : 
-        # dispatcher 1: receive poses osc messages from e.g mediapipe poses input app
-        # dispatcher 2: receive feedback values from RLHF app
-        # todo : (i) create realtime training infrastructure on linux gpu pc, transfering model statedict over local network to update 
-        # the model in inference. 
-        # (ii) implement model transfer functionality in inference app, to load the most recently received model state dict, 
-        # and compiling and providing the training data for the training server in realtime over local network.
-
-        print("Starting ableton agent")
-        #self.audio_thread = threading.Thread(target=self.start_audio_stream)
-        self.osc_thread = threading.Thread(target=self.start_osc_server)
-        #self.audio_thread = threading.Thread(target=self.start_audio_stream)
-        
-        #elf.audio_thread.start()
-        self.osc_thread.start()
-        self.start_audio_stream()
-        #self.audio_thread.start()
-        #self.start_osc_server()
-        
-        #self.osc_client_training_data.send_message("/testing", 0)
-
-        while True:
-            print('while loop started')
-            #t = time.time()
-            
-            audio_buffer, audio_buffer_count, pose_count = self.audio_buffers_and_pose_counts_deque[-1]
-            pose = self.poses_deque[pose_count]
-            print(pose)
-            #print(audio_buffer)
-            #print("Type of audio buffer:", type(audio_buffer), flush=True)
-            #print("Content of deque:", [type(item[0]) for item in list(self.audio_buffers_and_pose_counts_deque)], flush=True)
-
-            logits, class_prediction, softmax_values, input_audio = self.agent_model_inference(audio_buffer, pose)
-
-            self.transmit_training_data(logits, class_prediction, softmax_values, pose_count, audio_buffer_count, input_audio)
-            #self.current_audio_frame_play = self.current_audio_frame_read
-            #t = time.time()-t
-            #print('agent inference time = ', t)
+    
 
 
     def send_mod(self, cc=1, value=0):
@@ -489,6 +605,17 @@ class GestureApp:
         self.osc_client.send_message(clip_path + "/notes", [note, velocity, 100])  # 100ms length for the note
         self.osc_client.send_message(clip_path + "/deselect_all_notes", [])
         self.osc_client.send_message(clip_path + "/start_playing", [])
+
+
+    def get_active_model(self):
+        # Return the currently active model
+        return self.model1 if self.use_model1 else self.model2
+
+    def switch_models(self):
+        # Switch the active model
+        #print('switch model, time = ', time.time()-self.switch_time)
+        self.use_model1 = not self.use_model1
+        self.switch_time = time.time()
         
 
     def initial_state(self):
@@ -505,12 +632,6 @@ class GestureApp:
     def training_state(self):
         self.RLHF_training()
         pass
-
-
-    #def training_state(self):
-    #    self.train_model()
-        # Implementation for training state
-    #    pass
 
 
     def run(self):
