@@ -139,71 +139,49 @@ class MultiscaleSequence_MINE(nn.Module):
         self.linear_proj1 = nn.ModuleList([nn.Linear(self.latent_dim, self.latent_dim) for _ in range(len(self.time_scales_past) * len(self.time_scales_future))]) 
         self.linear_proj2 = nn.ModuleList([nn.Linear(self.latent_dim, self.latent_dim) for _ in range(len(self.time_scales_past) * len(self.time_scales_future))]) 
         self.down_proj = nn.ModuleList([nn.Linear(self.latent_dim, 1) for _ in range(len(self.time_scales_past) * len(self.time_scales_future))])
-        
-        self.pool_embs = nn.ModuleDict({
-            str(scale): nn.AvgPool1d(kernel_size=scale*16)
-            for scale in time_scales_past
-        })
-
-        # For joints and margs, the dominant dimension is the third one, so we pool over 128 times the future time scales
-        self.pool_joints_margs = nn.ModuleDict({
-            str(scale): nn.AvgPool1d(kernel_size=scale*128)
-            for scale in time_scales_future
-        })
-        self.running_mean = RunningMean()
+        self.running_means = [RunningMineMean() for _ in range(self.nr_future_timescales * self.nr_past_timescales)]
         
 
-    def forward(self, audio_embs, audio_joints, audio_margs, mine_values):
+    def forward(self, audio_embs, audio_joints, audio_margs):
+        # Encoding
+        # audio
+        # todo : introduce downsampling of the inputs, depending on the scales factors in self.nr_past_timescales, self.nr_future_timescales
+        # introduce mine calculation with the running mean, individually for all outputs 
+        # implement funcitonality to get training batch, run training loop, 
+        # maybe implement rwkv instead of GRU in the generative model 
+        # use pytorch lightning for the trnaing loop 
+        #current_mine_count = running_mean[0]
+        #current_mine_count = mine_values[0]
         outputs = []
-        
-        # Downscale and encode audio_joints and audio_margs
-        downscaled_joints = []
-        downscaled_margs = []
-        current_mine_count = mine_values[0]
-
-        for j, scale in enumerate(self.time_scales_future):
-            # Apply pooling to downscale, ensure the tensors are correctly shaped
-            # Adjust transpose and view operations as necessary based on your actual data dimensions
-            pooled_joint = self.pool_joints_margs[str(scale)](audio_joints[j].transpose(1, 2)).transpose(1, 2)
-            pooled_marg = self.pool_joints_margs[str(scale)](audio_margs[j].transpose(1, 2)).transpose(1, 2)
-
-            # Encode the downscaled tensors
-            encoded_joint = self.audio_encoder(pooled_joint)
-            encoded_marg = self.audio_encoder(pooled_marg)
-            
-            downscaled_joints.append(encoded_joint)
-            downscaled_margs.append(encoded_marg)
-
+        encoded_joints = [self.audio_encoder(joint) for joint in audio_joints]
+        encoded_margs = [self.audio_encoder(marg) for marg in audio_margs]
         idx = 0
+        
         for i, j in product(range(self.nr_past_timescales), range(self.nr_future_timescales)):
-            s_past = self.time_scales_past[i]
-            s_future = self.time_scales_future[j]
-
-            # Downscale audio_embs using the appropriate pooling layer
-            audio_emb_pooled = self.pool_embs[str(s_past)](audio_embs[i].transpose(1, 2)).transpose(1, 2)
-
-            # Use the precomputed and encoded joints and margs
-            z_joint, z_marg = downscaled_joints[j], downscaled_margs[j]
-
-            # Concatenate and process with neural network layers
-            # Ensure concatenation is along the correct dimension and results in correct shapes
-            y_joint = torch.cat((audio_emb_pooled, z_joint), dim=1).view(1, -1)  # Adjust shapes as necessary
-            y_marg = torch.cat((audio_emb_pooled, z_marg), dim=1).view(1, -1)  # Adjust shapes as necessary
-
-            # Sequential operations for joint and marg
+            
+            mine_mean = self.running_means[idx]
+            z_joint, z_marg = encoded_joints[j], encoded_margs[j]
+            #print('z_joint shape', z_joint.shape, 'z_marg shape', z_marg.shape)
+            y_joint, y_marg = torch.cat((audio_embs[i], z_joint), dim=0).view(1, 32), torch.cat((audio_embs[i], z_marg), dim=0).reshape(1, 32)
+            #print('y_joint, y_marg shapes', y_joint.shape, y_marg.shape)
             y_joint = F.relu(self.up_proj[idx](y_joint))
+            #print('y_joint up', y_joint.shape)
             y_joint = F.relu(self.linear_proj1[idx](y_joint))
             y_joint = F.relu(self.linear_proj2[idx](y_joint))
-            y_joint = F.relu(self.down_proj[idx](y_joint))
-            
+            #print('y_joint lin', y_joint.shape)
+            y_joint = F.relu(self.down_proj[idx](y_joint)).squeeze()
             y_marg = F.relu(self.up_proj[idx](y_marg))
             y_marg = F.relu(self.linear_proj1[idx](y_marg))
             y_marg = F.relu(self.linear_proj2[idx](y_marg))
-            y_marg = F.relu(self.down_proj[idx](y_marg))
-            
-            outputs.append([y_joint, y_marg])
+            y_marg = F.relu(self.down_proj[idx](y_marg)).squeeze()
+            #print(y_joint, y_marg)
+            #mine_mean.update(y_joint, y_marg)
+            #mine_value = mine_mean.mine_mean()
+            outputs.append(mine_mean.update(y_joint, y_marg))
             idx += 1
-
+            
+        
+        #print(len(outputs))
         return outputs
     
 
