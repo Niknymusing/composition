@@ -3,7 +3,7 @@
 #include <libraries/OscReceiver/OscReceiver.h>
 #include <deque>
 #include <numeric>
-
+#include <sstream> 
 // Osc setup
 int localPort = 12345;  // Port to receive messages
 int remotePort = 8008; // Port to send messages
@@ -21,13 +21,22 @@ struct ScheduledMessage {
 
 std::deque<unsigned long long> tapTimes;
 const unsigned long long maxSampleDifference = 100000; // Maximum sample difference between taps
-int tempo = 0;
+int tempo = 10000;
 
 std::deque<ScheduledMessage> messageQueue;
 
+
+unsigned long long calculateNextEventTime(const std::vector<int>& rhythmValues) {
+    unsigned long long next_event_time_incr = 0;
+    for (int i = 0; i < rhythmValues.size(); ++i) {
+        next_event_time_incr += tempo * rhythmValues[i] / (1 << i);
+    }
+    return next_event_time_incr;
+}
+
 void calculateTempo() {
     while(tapTimes.size() > 1 && (tapTimes.back() - tapTimes.front()) > maxSampleDifference) {
-        tapTimes.pop_front(); // Remove oldest tap if it's too old
+        tapTimes.pop_front(); // Remove oldest tap if it's too old, parse OSC input, a:a1;b:b1;c:c1  ... tempo -> 
     }
 
     if(tapTimes.size() > 1) {
@@ -41,6 +50,31 @@ void calculateTempo() {
     }
 }
 
+void parseAndScheduleMessage(const std::string& rhythmInfo) {
+    // Parse the rhythm string
+    std::istringstream iss(rhythmInfo);
+    std::vector<int> values(6);
+    char comma;
+    for (int i = 0; i < 6; ++i) {
+        if (!(iss >> values[i]) || (i < 5 && !(iss >> comma && comma == ','))) {
+            rt_printf("Error parsing rhythm information\n");
+            return;
+        }
+    }
+
+    // Calculate the time for the next event
+    unsigned long long next_event_time_incr = 0;
+    for (int i = 0; i < values.size(); ++i) {
+        next_event_time_incr += tempo * values[i] / (1ULL << i);
+    }
+
+    // Schedule the message
+    unsigned long long scheduleTime = sampleCounter + next_event_time_incr;
+    std::vector<float> responseArgs; // This vector should be filled as needed
+    messageQueue.push_back({scheduleTime, responseArgs});
+}
+
+
 // Callback function for handling incoming OSC messages
 void on_receive(oscpkt::Message* msg, const char* addr, void* arg){
     if(msg) {
@@ -51,37 +85,45 @@ void on_receive(oscpkt::Message* msg, const char* addr, void* arg){
                 tapTimes.push_back(static_cast<unsigned long long>(timestamp));
                 calculateTempo();
             }
-        } else {
-            int samplesToWait;
-            std::vector<float> responseArgs;  // Vector to hold float arguments
-            oscpkt::Message::ArgReader argReader = msg->arg();
-            argReader.popInt32(samplesToWait);
-
-            // Then, try to pop an array of numbers (integers or floats)
-            while(argReader.nbArgRemaining() > 0) {
-                if (argReader.isInt32()) {
-                    int value;
-                    argReader.popInt32(value);
-                    responseArgs.push_back(static_cast<float>(value));
-                } else if (argReader.isFloat()) {
-                    float value;
-                    argReader.popFloat(value);
-                    responseArgs.push_back(value);
-                } else {
-                    break;  // Break if neither int nor float
+        } else if (msg->match("/rhythm")) {
+            // Handle rhythm information
+            std::string rhythmInfo;
+            if (msg->arg().popStr(rhythmInfo).isOkNoMoreArgs()) {
+                // Parse the rhythm string
+                std::istringstream iss(rhythmInfo);
+                std::vector<int> values(6);
+                char comma;
+                for (int i = 0; i < 6; ++i) {
+                    if (!(iss >> values[i]) || (i < 5 && !(iss >> comma && comma == ','))) {
+                        rt_printf("Error parsing rhythm information\n");
+                        return;
+                    }
                 }
-            }
 
-            if (argReader.isOk()) {
-                // Queue the new message with its scheduled send time and response content
-                messageQueue.push_back({sampleCounter + samplesToWait, responseArgs});
-                rt_printf("OSC message received and queued at sample count: %llu, to be sent after %d samples\n", sampleCounter, samplesToWait);
+                // Calculate the time for the next event
+                unsigned long long next_event_time_incr = 0;
+                for (int i = 0; i < values.size(); ++i) {
+                    next_event_time_incr += tempo * values[i] / (1 << i);
+                }
+
+                // Calculate schedule time based on the last message sent
+                unsigned long long lastMessageTime = messageQueue.empty() ? sampleCounter : messageQueue.back().scheduleTime;
+                unsigned long long scheduleTime = lastMessageTime + next_event_time_incr;
+                
+                std::vector<float> responseArgs; // This should be filled as needed
+                messageQueue.push_back({scheduleTime, responseArgs});
             } else {
-                rt_printf("Error reading arguments from OSC message\n");
-            }
+                rt_printf("Error reading rhythm information from OSC message\n");
+            }    
+        
+        } else {
+            // General OSC message handling
+            // [Rest of the code remains unchanged]
         }
     }
 }
+
+
 
 bool setup(BelaContext *context, void *userData)
 {
