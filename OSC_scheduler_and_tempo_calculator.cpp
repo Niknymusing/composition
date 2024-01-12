@@ -4,6 +4,10 @@
 #include <deque>
 #include <numeric>
 #include <sstream> 
+#include <mutex>
+
+
+
 // Osc setup
 int localPort = 12345;  // Port to receive messages
 int remotePort = 8008; // Port to send messages
@@ -24,34 +28,46 @@ const unsigned long long maxSampleDifference = 100000; // Maximum sample differe
 int tempo = 10000;
 
 std::deque<ScheduledMessage> messageQueue;
+std::mutex tempoMutex;
 
 
-unsigned long long calculateNextEventTime(const std::vector<int>& rhythmValues) {
-    unsigned long long next_event_time_incr = 0;
-    for (int i = 0; i < rhythmValues.size(); ++i) {
-        next_event_time_incr += tempo * rhythmValues[i] / (1 << i);
-    }
-    return next_event_time_incr;
-}
+
+
 
 void calculateTempo() {
-    while(tapTimes.size() > 1 && (tapTimes.back() - tapTimes.front()) > maxSampleDifference) {
-        tapTimes.pop_front(); // Remove oldest tap if it's too old, parse OSC input, a:a1;b:b1;c:c1  ... tempo -> 
-    }
+    // Ensure at least 2 samples for calculation
+    if(tapTimes.size() >= 2) {
+        // Get the last two tap times
+        unsigned long long lastTap = tapTimes.back();
+        unsigned long long secondLastTap = tapTimes[tapTimes.size() - 2];
 
-    if(tapTimes.size() > 1) {
-        std::vector<unsigned long long> intervals;
-        for(size_t i = 1; i < tapTimes.size(); ++i) {
-            intervals.push_back(tapTimes[i] - tapTimes[i-1]);
+        // Calculate the interval and check against maxSampleDifference
+        unsigned long long interval = lastTap - secondLastTap;
+        if(interval > 0 && interval <= maxSampleDifference) {
+            tempo = static_cast<int>(interval);
+            double bpm = (44100.0 / tempo) * 60.0; // Convert to BPM
+            rt_printf("Updated tempo: %f BPM\n", bpm);
+        } else {
+            rt_printf("Interval is invalid (zero, too large, or more than maxSampleDifference), cannot update tempo\n");
         }
 
-        unsigned long long sum = std::accumulate(intervals.begin(), intervals.end(), 0ULL);
-        tempo = static_cast<int>(sum / intervals.size());
+        // Remove all but the last tap time to ensure only the last two are used next time
+        while(tapTimes.size() > 1) {
+            tapTimes.pop_front();
+        }
+    } else {
+        rt_printf("Not enough tap times to calculate tempo\n");
     }
 }
+
+
+
+
+
 
 void parseAndScheduleMessage(const std::string& rhythmInfo) {
     // Parse the rhythm string
+    //std::lock_guard<std::mutex> lock(tempoMutex);
     std::istringstream iss(rhythmInfo);
     std::vector<int> values(6);
     char comma;
@@ -75,16 +91,23 @@ void parseAndScheduleMessage(const std::string& rhythmInfo) {
 }
 
 
+unsigned long long calculateNextEventTime(const std::vector<int>& rhythmValues) {
+    unsigned long long next_event_time_incr = 0;
+    for (int i = 0; i < rhythmValues.size(); ++i) {
+        next_event_time_incr += tempo * rhythmValues[i] / (1 << i);
+    }
+    return next_event_time_incr;
+}
+
+
 // Callback function for handling incoming OSC messages
 void on_receive(oscpkt::Message* msg, const char* addr, void* arg){
     if(msg) {
-        if(msg->match("/trill")) {
-            oscpkt::Message::ArgReader argReader = msg->arg();
-            int64_t timestamp;
-            if(argReader.popInt64(timestamp).isOkNoMoreArgs()) {
-                tapTimes.push_back(static_cast<unsigned long long>(timestamp));
-                calculateTempo();
-            }
+        if(msg->match("/tempo")) {
+            // Push the current sampleCounter instead of the timestamp
+            tapTimes.push_back(sampleCounter);
+            calculateTempo();
+        	
         } else if (msg->match("/rhythm")) {
             // Handle rhythm information
             std::string rhythmInfo;
